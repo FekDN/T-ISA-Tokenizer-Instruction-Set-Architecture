@@ -140,6 +140,7 @@ It is important to note that T-ISA is currently a proof-of-concept. While it has
 ## License
 
 The source code of this project is licensed under the **Apache License 2.0**. A full copy of the license is available in the `LICENSE` file in the root directory of this repository and can also be viewed at [https://www.apache.org/licenses/LICENSE-2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
 ---
 *   Dmitry Feklin
 *   feklindn@gmail.com
