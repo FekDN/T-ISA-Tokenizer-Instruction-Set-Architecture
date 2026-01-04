@@ -163,7 +163,15 @@ class TISAVM:
     def __init__(self, resources):
         self.res = resources
         self.id_to_token = {}
-        if self.res and 'vocab' in self.res: self.id_to_token = {v: k for k, v in self.res['vocab'].items()}
+        if self.res and 'vocab' in self.res:
+            vocab_data = self.res['vocab']
+            if isinstance(vocab_data, dict):
+                # Standard case (BPE, WordPiece): {"token": id}
+                self.id_to_token = {v: k for k, v in vocab_data.items()}
+            elif isinstance(vocab_data, list):
+                # Unigram case: [["token", score], ...]
+                # The ID here is simply an index into the list.
+                self.id_to_token = {i: token for i, (token, score) in enumerate(vocab_data)}
         self.dispatch = {
             0x01: Primitives.LOWERCASE,
             0x02: Primitives.UNICODE_NORM,
