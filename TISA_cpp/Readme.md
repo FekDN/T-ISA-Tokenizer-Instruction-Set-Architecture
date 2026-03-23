@@ -1,4 +1,4 @@
-tests.py - starts the compilation of test manifests.
+generate_test_suite.py - starts the compilation of test manifests.
 
 To test, need to copy the result (all files from the tisa_build directory) to the SD card.
 
