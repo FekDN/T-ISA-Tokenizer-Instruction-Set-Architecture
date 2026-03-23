@@ -23,7 +23,7 @@ static uint32_t utf8_to_codepoint(const unsigned char* s, size_t len) {
         default: return 0;
     }
 }
-static std::string codepoint_to_utf8(uint32_t cp) {
+std::string codepoint_to_utf8(uint32_t cp) {
     std::string result;
     if (cp < 0x80) { result += static_cast<char>(cp); }
     else if (cp < 0x800) { result += static_cast<char>(0xC0 | (cp >> 6)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
@@ -305,45 +305,79 @@ std::vector<int32_t> TISAVM::run(const std::vector<uint8_t>& mf, const std::stri
 
 void TISAVM::_dispatch_opcode(uint8_t op, const uint8_t* p, size_t len, TISA_State& s){
     switch (op) {
-case 0x01: { // LOWERCASE — full-fledged Unicode (Cyrillic + Latin Extended)
+case 0x01: {
     std::string lower_text;
+    const size_t exc_count = sizeof(LOWERCASE_EXCEPTIONS) / sizeof(UnicodeException);
+    const size_t rng_count = sizeof(LOWERCASE_RANGES) / sizeof(UnicodeRange);
     for (size_t i = 0; i < s.text.length(); ) {
         size_t char_len = get_utf8_char_len(s.text[i]);
         if (char_len == 0) { i++; continue; }
-
         uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], char_len);
         uint32_t lower_cp = cp;
-
-        if (cp >= 'A' && cp <= 'Z') lower_cp = cp + 32;                    // ASCII
-        else if (cp >= 0x0410 && cp <= 0x042F) lower_cp = cp + 32;         // А-Я → а-я
-        else if (cp >= 0x00C0 && cp <= 0x00D6) lower_cp = cp + 0x20;       // À-Ö
-        else if (cp >= 0x00D8 && cp <= 0x00DE) lower_cp = cp + 0x20;       // Ø-Þ
-        else if (cp >= 0x0391 && cp <= 0x03A1) lower_cp = cp + 0x20;       // Greek (just in case)
-
+        // 1. Проверяем исключения (точечные маппинги, напр. İ→i)
+        {
+            int lo = 0, hi = (int)exc_count - 1;
+            while (lo <= hi) {
+                int mid = lo + (hi - lo) / 2;
+                uint32_t from = pgm_read_dword(&LOWERCASE_EXCEPTIONS[mid].from);
+                if (cp == from) { lower_cp = pgm_read_dword(&LOWERCASE_EXCEPTIONS[mid].to); break; }
+                else if (cp < from) hi = mid - 1; else lo = mid + 1;
+            }
+        }
+        // 2. Если не нашли исключение — ищем в диапазонах
+        if (lower_cp == cp) {
+            int lo = 0, hi = (int)rng_count - 1;
+            while (lo <= hi) {
+                int mid = lo + (hi - lo) / 2;
+                uint32_t start = pgm_read_dword(&LOWERCASE_RANGES[mid].start);
+                uint32_t end   = pgm_read_dword(&LOWERCASE_RANGES[mid].end);
+                if (cp < start) hi = mid - 1;
+                else if (cp > end) lo = mid + 1;
+                else {
+                    int32_t delta = (int32_t)pgm_read_dword(&LOWERCASE_RANGES[mid].delta);
+                    lower_cp = (uint32_t)((int32_t)cp + delta);
+                    break;
+                }
+            }
+        }
         lower_text += codepoint_to_utf8(lower_cp);
         i += char_len;
     }
     s.text = lower_text;
     break;
 }
-case 0x02: { // UNICODE_NORM
-    std::string form((char*)&p[1], p[0]); // form = "NFD" or "NFC"
-    std::string normalized_text;
-    for (size_t i = 0; i < s.text.length(); ) {
-        size_t cl = get_utf8_char_len(s.text[i]);
-        if (cl == 0) { i++; continue; }
-        uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], cl);
-
-        if (form == "NFD" && is_category(cp, "Mn")) {
-            // skip combining marks (strip accents после NFD)
+case 0x02: {
+    std::string form((char*)&p[1], p[0]);
+    if (form == "NFD") {
+        // Шаг 1: NFD-декомпозиция через DECOMP_TABLE
+        std::string decomposed;
+        const size_t decomp_count = sizeof(DECOMP_TABLE) / sizeof(Decomp);
+        for (size_t i = 0; i < s.text.length(); ) {
+            size_t cl = get_utf8_char_len(s.text[i]);
+            if (cl == 0) { i++; continue; }
+            uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], cl);
+            // Бинарный поиск в DECOMP_TABLE
+            int lo = 0, hi = (int)decomp_count - 1;
+            bool found = false;
+            while (lo <= hi) {
+                int mid = lo + (hi - lo) / 2;
+                uint32_t from = pgm_read_dword(&DECOMP_TABLE[mid].from);
+                if (cp == from) {
+                    decomposed += codepoint_to_utf8(pgm_read_dword(&DECOMP_TABLE[mid].to1));
+                    uint32_t to2 = pgm_read_dword(&DECOMP_TABLE[mid].to2);
+                    if (to2) decomposed += codepoint_to_utf8(to2);
+                    found = true; break;
+                } else if (cp < from) hi = mid - 1;
+                else lo = mid + 1;
+            }
+            if (!found) decomposed += s.text.substr(i, cl);
             i += cl;
-            continue;
         }
-        // For NFC and the rest, leave it as is (or you can add decomposition, but for now it's enough)
-        normalized_text += s.text.substr(i, cl);
-        i += cl;
+        s.text = decomposed;
+        // Шаг 2: FILTER_CATEGORY(Mn) будет вызван отдельным опкодом 0x04
+        // (компилятор всегда выдаёт 0x02 NFD + 0x04 Mn парой)
     }
-    s.text = normalized_text;
+    // Для NFC: оставляем как есть (нормальный UTF-8 уже в NFC)
     break;
 }
         case 0x03: { 
@@ -398,7 +432,7 @@ case 0x15: { // BYTE_ENCODE
         s.fragments.push_back({s.text, false});
     }
     
-    // Applying byte encoding to unprotected fragments (Python lines 72-80)
+    // Apply byte encoding to unprotected fragments
     for (auto& f : s.fragments) {
         if (f.is_protected) continue;
         
@@ -409,10 +443,11 @@ case 0x15: { // BYTE_ENCODE
             auto it = m_res.byte_map.find(byte);
             if (it != m_res.byte_map.end()) {
                 encoded += it->second;
-            } else {
-                // If the byte is not found in the map, leave it as is (this shouldn't happen)
-                encoded += f.text[i];
             }
+            // The 'else' block has been removed. A complete byte_map with 256 entries is a
+            // precondition for this algorithm. Appending a raw byte here corrupts
+            // the UTF-8 stream and is a critical bug. If a byte is missing from the map,
+            // it's better to drop it (or fix the resource generator) than to crash the entire pipeline.
         }
         f.text = encoded;
     }
@@ -475,6 +510,7 @@ static std::string unescape_protected_pattern(const std::string& p) {
     return result;
 }
 
+
 // A completely rewritten function that mimics Python logic
 void TISAVM::_primitive_partition_rules(TISA_State& state, const uint8_t* p, size_t len) {
     state.fragments.clear();
@@ -522,17 +558,17 @@ void TISAVM::_primitive_partition_rules(TISA_State& state, const uint8_t* p, siz
     // Modifying pattern for protected rules
     // In Python (lines 42-45): If a protected rule AND starts with < or [,
     // AND DOES NOT start with "(?: ?)", then "(?: ?)" is added to the beginning
-    for (auto& rule : rules) {
-        if (rule.is_protected) {
-            const std::string& p = rule.pattern;
-            if (!p.empty() && (p[0] == '<' || p[0] == '[')) {
-                // Check that the pattern does NOT start with "(?: ?)"
-                if (rule.pattern.rfind("(?: ?)", 0) != 0) {
-                    rule.pattern = "(?: ?)" + rule.pattern;
-                }
-            }
-        }
-    }
+    //for (auto& rule : rules) {
+    //    if (rule.is_protected) {
+    //        const std::string& p = rule.pattern;
+    //        if (!p.empty() && (p[0] == '<' || p[0] == '[')) {
+    //            // Check that the pattern does NOT start with "(?: ?)"
+    //            if (rule.pattern.rfind("(?: ?)", 0) != 0) {
+    //                rule.pattern = "(?: ?)" + rule.pattern;
+    //            }
+    //        }
+    //    }
+    //}
 
     // Basic text processing loop
     size_t last_pos = 0;
@@ -559,22 +595,33 @@ void TISAVM::_primitive_partition_rules(TISA_State& state, const uint8_t* p, siz
                 
                 if (p1 != std::string::npos && (p2 == std::string::npos || p1 <= p2)) {
                     m_start = p1; 
-                    m_end = p1 + inner.length();
+                    m_end = p1 + literal.length();
                 } else if (p2 != std::string::npos) {
                     m_start = p2; 
-                    m_end = p2 + 1 + inner.length();
+                    m_end = p2 + 1 + literal.length();
                 }
             }
             else if (rule.pattern == "\\p{P}") {
-                // Search for punctuation
+                // Guaranteed isolation of punctuation for BERT/WordPiece (including ASCII)
                 for (size_t k = last_pos; k < text.length(); ) {
                     size_t cl = get_utf8_char_len(text[k]);
                     if (cl == 0) { ++k; continue; }
-                    if (is_punctuation(utf8_to_codepoint((const unsigned char*)&text[k], cl))) {
-                        m_start = k; 
-                        m_end = k + cl; 
-                        break;
+                    uint32_t cp = utf8_to_codepoint((const unsigned char*)&text[k], cl);
+
+                    // COMBINED CHECK: first a quick ASCII check, then a full one using the Unicode table
+                    bool is_punc = 
+                        (cp == '.' || cp == ',' || cp == '!' || cp == '?' ||
+                         cp == ':' || cp == ';' || cp == '"' || cp == '\'' ||
+                         cp == '(' || cp == ')' || cp == '[' || cp == ']' ||
+                         cp == '{' || cp == '}') 
+                        || is_category(cp, "P");
+
+                    if (is_punc) {
+                        m_start = k;    // Found a match
+                        m_end = k + cl;
+                        break;          // Stop searching, as we only need the first character
                     }
+                    
                     k += cl;
                 }
             }
@@ -617,22 +664,56 @@ void TISAVM::_primitive_partition_rules(TISA_State& state, const uint8_t* p, siz
                 m_start = find_gpt_next_token(text, last_pos, m_end);
             }
             else { 
-                // A regular string (including protected tokens)
-                std::string search_pat = rule.pattern;
-                if (rule.is_protected) {
-                    search_pat = unescape_protected_pattern(rule.pattern);
+                // Unescape into a stack buffer — ZERO heap allocation.
+                // This avoids any std::string heap failures on ESP32 during nested SD-card reads.
+                char lit[256];
+                size_t lit_len = 0;
+                {
+                    const char* pat = rule.pattern.data();
+                    size_t plen = rule.pattern.size();
+                    for (size_t j = 0; j < plen && lit_len < 254; ++j) {
+                        if (pat[j] == '\\' && j + 1 < plen) {
+                            lit[lit_len++] = pat[++j];
+                        } else {
+                            lit[lit_len++] = pat[j];
+                        }
+                    }
                 }
-                m_start = text.find(search_pat, last_pos);
-                if (m_start != std::string::npos) {
-                    m_end = m_start + search_pat.length();
+
+                // DEBUG: print first protected rule's literal at position 0 only
+                if (rule.is_protected && last_pos == 0 && lit_len > 0) {
+                    lit[lit_len] = '\0';
+                    //Serial.printf("  DBG lit='%s' len=%u\n", lit, (unsigned)lit_len);
+                }
+
+                if (lit_len > 0) {
+                    // Manual memcmp search — no std::string allocation at all
+                    const char* haystack = text.data();
+                    size_t haylen = text.length();
+                    for (size_t k = last_pos; k + lit_len <= haylen; ++k) {
+                        if (memcmp(haystack + k, lit, lit_len) == 0) {
+                            m_start = k;
+                            m_end   = k + lit_len;
+                            break;
+                        }
+                    }
                 }
             }
 
             // Select the earliest match
-            if (m_start != std::string::npos && m_start < best_start) {
-                best_start = m_start;
-                best_end   = m_end;
-                best_rule_idx = i;
+            if (m_start != std::string::npos) {
+                if (m_start < best_start) {
+                    // This is a new, earlier match. Take it.
+                    best_start = m_start;
+                    best_end = m_end;
+                    best_rule_idx = i;
+                } else if (m_start == best_start) {
+                    // A match at the same position. Prefer the longer one.
+                    if ((m_end - m_start) > (best_end - best_start)) {
+                        best_end = m_end;
+                        best_rule_idx = i;
+                    }
+                }
             }
         }
 

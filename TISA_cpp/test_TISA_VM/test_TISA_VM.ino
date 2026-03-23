@@ -49,112 +49,113 @@ struct TestStats {
 
 class ModelResourceLoader {
 public:
-    static bool load_resources(const std::string& model_hash, VM_Resources& resources) {
-        std::string base_path = "/models/" + model_hash + "/";
-        
-        Serial.printf("Loading model resources from: %s\n", base_path.c_str());
-        
-        // 1. Loading vocab.b
-        std::string vocab_path = base_path + "vocab.b";
-        if (!sdcard.openFile(vocab_path.c_str())) {
-            Serial.printf("ERROR: Cannot open vocab.b\n");
-            return false;
-        }
-        
-        uint32_t vocab_size;
-        sdcard.readData((uint8_t*)&vocab_size, sizeof(vocab_size));
-        
-        // Calculating offsets within a file
-        size_t file_size = sdcard.size();
-        uint64_t vocab_offset = sdcard.getPosition();  // Position after reading vocab_size
-        uint32_t data_section_offset = vocab_offset + (vocab_size * sizeof(uint32_t));
-        uint32_t vocab_data_size = file_size - data_section_offset;
-        
-        sdcard.closeFile();  // Close the file - ResourceView will open it automatically
-        
-        // Pass the PATH to the file along with the offset
-        resources.vocab = std::make_unique<BinaryVocabView>(vocab_path, vocab_offset, vocab_data_size);
-        
-        Serial.printf("  ✓ vocab.b loaded: %u entries\n", resources.vocab->get_entry_count());
-        
-        // 2. Loading vocab_idx.b (for decoding)
-        std::string vocab_idx_path = base_path + "vocab_idx.b";
-        if (!sdcard.openFile(vocab_idx_path.c_str())) {
-            Serial.printf("ERROR: Cannot open vocab_idx.b\n");
-            return false;
-        }
-        
-        uint32_t idx_size;
-        sdcard.readData((uint8_t*)&idx_size, sizeof(idx_size));
+static bool load_resources(const std::string& model_hash, VM_Resources& resources) {
+    std::string base_path = "/models/" + model_hash + "/";
+    
+    Serial.printf("Loading model resources from: %s\n", base_path.c_str());
+    
+    // ================= vocab.b =================
+    std::string vocab_path = base_path + "vocab.b";
+    if (!sdcard.openFile(vocab_path.c_str())) {
+        Serial.printf("ERROR: Cannot open vocab.b\n");
+        return false;
+    }
+    
+    uint32_t vocab_size;
+    sdcard.readData((uint8_t*)&vocab_size, sizeof(vocab_size));
+    
+    size_t file_size = sdcard.size();
+    uint64_t vocab_offset = sdcard.getPosition();
+    uint32_t data_section_offset = vocab_offset + (vocab_size * sizeof(uint32_t));
+    uint32_t vocab_data_size = file_size - data_section_offset;
+    
+    sdcard.closeFile();
+    
+    resources.vocab = std::make_unique<BinaryVocabView>(vocab_path, vocab_offset, vocab_data_size);
+    
+    Serial.printf("  ✓ vocab.b loaded: %u entries\n", resources.vocab->get_entry_count());
+    
+    // ================= vocab_idx.b =================
+    std::string vocab_idx_path = base_path + "vocab_idx.b";
+    if (!sdcard.openFile(vocab_idx_path.c_str())) {
+        Serial.printf("ERROR: Cannot open vocab_idx.b\n");
+        return false;
+    }
+    
+    uint32_t idx_size;
+    sdcard.readData((uint8_t*)&idx_size, sizeof(idx_size));
+    
+    file_size = sdcard.size();
+    uint64_t idx_offset = sdcard.getPosition();
+    uint32_t idx_data_size = file_size - idx_offset;
+    
+    sdcard.closeFile();
+    
+    resources.vocab_idx_for_decode = std::make_unique<BinaryVocabIndexView>(vocab_idx_path, idx_offset, idx_data_size);
+    
+    Serial.printf("  ✓ vocab_idx.b loaded: %u entries\n", resources.vocab_idx_for_decode->get_entry_count());
+    
+    // ================= merges.b =================
+    std::string merges_path = base_path + "merges.b";
+    if (sdcard.openFile(merges_path.c_str())) {
+        uint32_t merges_count;
+        sdcard.readData((uint8_t*)&merges_count, sizeof(merges_count));
         
         file_size = sdcard.size();
-        uint64_t idx_offset = sdcard.getPosition();
-        uint32_t idx_data_size = file_size - idx_offset;
+        uint64_t merges_offset = sdcard.getPosition();
+        uint32_t merges_data_size = file_size - merges_offset;
         
         sdcard.closeFile();
         
-        resources.vocab_idx_for_decode = std::make_unique<BinaryVocabIndexView>(vocab_idx_path, idx_offset, idx_data_size);
+        resources.merges = std::make_unique<BinaryMergesView>(merges_path, merges_offset, merges_data_size);
         
-        Serial.printf("  ✓ vocab_idx.b loaded: %u entries\n", resources.vocab_idx_for_decode->get_entry_count());
-        
-        // 3. Loading merges.b (optional, BPE only)
-        std::string merges_path = base_path + "merges.b";
-        if (sdcard.openFile(merges_path.c_str())) {
-            uint32_t merges_count;
-            sdcard.readData((uint8_t*)&merges_count, sizeof(merges_count));
-            
-            file_size = sdcard.size();
-            uint64_t merges_offset = sdcard.getPosition();
-            uint32_t merges_data_size = file_size - merges_offset;
-            
-            sdcard.closeFile();
-            
-            resources.merges = std::make_unique<BinaryMergesView>(merges_path, merges_offset, merges_data_size);
-            
-            Serial.printf("  ✓ merges.b loaded: %u entries\n", resources.merges->get_entry_count());
-        } else {
-            Serial.printf("  ℹ merges.b not found (not a BPE model)\n");
-        }
-        
-        // 4. Creating a byte_map (standard for all models)
-        std::vector<uint8_t> bs;
-        for (int i = 33; i <= 126; i++) bs.push_back(i);
-        for (int i = 161; i <= 172; i++) bs.push_back(i);
-        for (int i = 174; i <= 255; i++) bs.push_back(i);
-        
-        std::vector<uint8_t> remaining;
-        for (int i = 0; i < 256; i++) {
-            if (std::find(bs.begin(), bs.end(), i) == bs.end()) {
-                remaining.push_back(i);
-            }
-        }
-        
-        for (size_t i = 0; i < bs.size(); i++) {
-            uint32_t cp = bs[i];
-            std::string utf8_char(1, static_cast<char>(cp));
-            resources.byte_map[bs[i]] = utf8_char;
-        }
-        
-        for (size_t i = 0; i < remaining.size(); i++) {
-            uint32_t cp = 256 + i;
-            std::string utf8_char;
-            if (cp < 0x80) {
-                utf8_char += static_cast<char>(cp);
-            } else if (cp < 0x800) {
-                utf8_char += static_cast<char>(0xC0 | (cp >> 6));
-                utf8_char += static_cast<char>(0x80 | (cp & 0x3F));
-            } else if (cp < 0x10000) {
-                utf8_char += static_cast<char>(0xE0 | (cp >> 12));
-                utf8_char += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                utf8_char += static_cast<char>(0x80 | (cp & 0x3F));
-            }
-            resources.byte_map[remaining[i]] = utf8_char;
-        }
-        
-        Serial.printf("  ✓ byte_map created: %u entries\n", resources.byte_map.size());
-        
-        return true;
+        Serial.printf("  ✓ merges.b loaded: %u entries\n", resources.merges->get_entry_count());
+    } else {
+        Serial.printf("  ℹ merges.b not found (not a BPE model)\n");
     }
+    
+    // ================= byte_map =================
+    // O(256), без std::find
+    std::array<bool, 256> used{};
+    
+    auto add_utf8 = [](uint32_t cp) {
+        std::string s;
+        if (cp < 0x80) {
+            s += (char)cp;
+        } else if (cp < 0x800) {
+            s += (char)(0xC0 | (cp >> 6));
+            s += (char)(0x80 | (cp & 0x3F));
+        } else {
+            s += (char)(0xE0 | (cp >> 12));
+            s += (char)(0x80 | ((cp >> 6) & 0x3F));
+            s += (char)(0x80 | (cp & 0x3F));
+        }
+        return s;
+    };
+    
+    // базовый набор
+    for (int i = 33; i <= 126; i++) used[i] = true;
+    for (int i = 161; i <= 172; i++) used[i] = true;
+    for (int i = 174; i <= 255; i++) used[i] = true;
+    
+    for (int i = 0; i < 256; i++) {
+        if (used[i]) {
+            resources.byte_map[(uint8_t)i] = add_utf8(i);
+        }
+    }
+    
+    uint32_t extra = 0;
+    for (int i = 0; i < 256; i++) {
+        if (!used[i]) {
+            resources.byte_map[(uint8_t)i] = add_utf8(256 + extra);
+            extra++;
+        }
+    }
+    
+    Serial.printf("  ✓ byte_map created: %u entries\n", resources.byte_map.size());
+    
+    return true;
+}
 };
 
 // ============================================================================
@@ -163,74 +164,64 @@ public:
 
 class TestSuiteLoader {
 public:
-    static bool load_test_suite(const char* filename, std::vector<TestCase>& test_cases) {
-        if (!sdcard.openFile(filename)) {
-            Serial.printf("ERROR: Cannot open test suite file: %s\n", filename);
-            return false;
-        }
-        
-        // Checking 'magic'
-        char magic[4];
-        sdcard.readData((uint8_t*)magic, 4);
-        if (memcmp(magic, "TSTS", 4) != 0) {
-            Serial.printf("ERROR: Invalid magic in test suite file\n");
-            sdcard.closeFile();
-            return false;
-        }
-        
-        // Reading the number of tests
-        uint32_t test_count;
-        sdcard.readData((uint8_t*)&test_count, sizeof(test_count));
-        
-        Serial.printf("\n==========================================================\n");
-        Serial.printf("Test Suite: %s\n", filename);
-        Serial.printf("Total tests: %u\n", test_count);
-        Serial.printf("==========================================================\n\n");
-        
-        test_cases.reserve(test_count);
-        
-        for (uint32_t i = 0; i < test_count; i++) {
-            TestCase tc;
-            
-            // Reading model_id
-            uint16_t model_id_len;
-            sdcard.readData((uint8_t*)&model_id_len, sizeof(model_id_len));
-            std::vector<char> model_id_buf(model_id_len + 1);
-            sdcard.readData((uint8_t*)model_id_buf.data(), model_id_len);
-            model_id_buf[model_id_len] = '\0';
-            tc.model_id = std::string(model_id_buf.data());
-            
-            // Reading text
-            uint32_t text_len;
-            sdcard.readData((uint8_t*)&text_len, sizeof(text_len));
-            std::vector<char> text_buf(text_len + 1);
-            sdcard.readData((uint8_t*)text_buf.data(), text_len);
-            text_buf[text_len] = '\0';
-            tc.text = std::string(text_buf.data());
-            
-            // Reading manifest
-            uint32_t manifest_len;
-            sdcard.readData((uint8_t*)&manifest_len, sizeof(manifest_len));
-            tc.manifest.resize(manifest_len);
-            sdcard.readData(tc.manifest.data(), manifest_len);
-            
-            // Reading ref_ids
-            uint32_t ref_ids_count;
-            sdcard.readData((uint8_t*)&ref_ids_count, sizeof(ref_ids_count));
-            tc.ref_ids.resize(ref_ids_count);
-            sdcard.readData((uint8_t*)tc.ref_ids.data(), ref_ids_count * sizeof(int32_t));
-            
-            test_cases.push_back(std::move(tc));
-            
-            // Progress
-            if ((i + 1) % 10 == 0 || i == test_count - 1) {
-                Serial.printf("Loaded %u/%u tests...\n", i + 1, test_count);
-            }
-        }
-        
-        sdcard.closeFile();
-        return true;
+static bool load_test_suite(const char* filename, std::vector<TestCase>& test_cases) {
+    if (!sdcard.openFile(filename)) {
+        Serial.printf("ERROR: Cannot open test suite file: %s\n", filename);
+        return false;
     }
+    
+    char magic[4];
+    sdcard.readData((uint8_t*)magic, 4);
+    if (memcmp(magic, "TSTS", 4) != 0) {
+        Serial.printf("ERROR: Invalid magic\n");
+        sdcard.closeFile();
+        return false;
+    }
+    
+    uint32_t test_count;
+    sdcard.readData((uint8_t*)&test_count, sizeof(test_count));
+    
+    test_cases.clear();
+    test_cases.reserve(test_count);
+    
+    std::vector<char> buffer;
+    
+    for (uint32_t i = 0; i < test_count; i++) {
+        TestCase tc;
+        
+        uint16_t len16;
+        uint32_t len32;
+        
+        // model_id
+        sdcard.readData((uint8_t*)&len16, 2);
+        buffer.resize(len16 + 1);
+        sdcard.readData((uint8_t*)buffer.data(), len16);
+        buffer[len16] = 0;
+        tc.model_id.assign(buffer.data());
+        
+        // text
+        sdcard.readData((uint8_t*)&len32, 4);
+        buffer.resize(len32 + 1);
+        sdcard.readData((uint8_t*)buffer.data(), len32);
+        buffer[len32] = 0;
+        tc.text.assign(buffer.data());
+        
+        // manifest
+        sdcard.readData((uint8_t*)&len32, 4);
+        tc.manifest.resize(len32);
+        sdcard.readData(tc.manifest.data(), len32);
+        
+        // ref_ids
+        sdcard.readData((uint8_t*)&len32, 4);
+        tc.ref_ids.resize(len32);
+        sdcard.readData((uint8_t*)tc.ref_ids.data(), len32 * 4);
+        
+        test_cases.push_back(std::move(tc));
+    }
+    
+    sdcard.closeFile();
+    return true;
+}
 };
 
 // ============================================================================
@@ -241,55 +232,51 @@ class TISATestRunner {
 private:
     std::map<std::string, std::string> model_hash_cache;
     
-    std::string get_model_hash(const std::string& model_id) {
-        // Checking the cache
-        auto it = model_hash_cache.find(model_id);
-        if (it != model_hash_cache.end()) {
-            return it->second;
+std::string get_model_hash(const std::string& model_id) {
+    auto it = model_hash_cache.find(model_id);
+    if (it != model_hash_cache.end()) return it->second;
+    
+    if (!sdcard.openFile("/models/model_map.txt")) return "";
+    
+    char line[512];
+    
+    while (true) {
+        int pos = 0;
+        
+        while (pos < 511) {
+            uint8_t ch;
+            if (sdcard.readData(&ch, 1) == 0) break;
+            if (ch == '\n') break;
+            line[pos++] = ch;
         }
         
-        // Reading from model_map.txt
-        if (sdcard.openFile("/models/model_map.txt")) {
-            char line_buf[512];
-            while (true) {
-                // Let's read it line by line
-                int pos = 0;
-                while (pos < 511) {
-                    uint8_t ch;
-                    if (sdcard.readData(&ch, 1) == 0) break;
-                    if (ch == '\n') break;
-                    line_buf[pos++] = ch;
-                }
-                if (pos == 0 && sdcard.getPosition() >= sdcard.size()) break; // End of file check
-                line_buf[pos] = '\0';
-                
-                // Parsing the string "model_id:hash"
-                std::string line(line_buf);
-                size_t colon_pos = line.find(':');
-                if (colon_pos != std::string::npos) {
-                    std::string mid = line.substr(0, colon_pos);
-                    std::string hash = line.substr(colon_pos + 1);
-                    
-                    // Remove all whitespace characters from the end of the line (spaces, \r, \n, etc.)
-                    // This fixes an error with an invalid file path.
-                    while (!hash.empty() && isspace(hash.back())) {
-                        hash.pop_back();
-                    }
-
-                    model_hash_cache[mid] = hash;
-                    
-                    if (mid == model_id) {
-                        sdcard.closeFile();
-                        return hash;
-                    }
-                }
-                 if (sdcard.getPosition() >= sdcard.size()) break; // Additional end-of-file check
+        if (pos == 0 && sdcard.getPosition() >= sdcard.size()) break;
+        
+        line[pos] = 0;
+        
+        char* colon = strchr(line, ':');
+        if (colon) {
+            *colon = 0;
+            char* hash = colon + 1;
+            
+            // trim
+            char* end = hash + strlen(hash) - 1;
+            while (end >= hash && isspace(*end)) *end-- = 0;
+            
+            model_hash_cache[line] = hash;
+            
+            if (model_id == line) {
+                sdcard.closeFile();
+                return hash;
             }
-            sdcard.closeFile();
         }
         
-        return "";
+        if (sdcard.getPosition() >= sdcard.size()) break;
     }
+    
+    sdcard.closeFile();
+    return "";
+}
     
 public:
     std::vector<TestResult> run_tests(const std::vector<TestCase>& test_cases) {
@@ -403,7 +390,7 @@ public:
             
             results.push_back(result);
             
-            delay(50);
+            //delay(50);
         }
         
         // Вывод итоговой статистики
