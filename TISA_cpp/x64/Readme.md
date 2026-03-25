@@ -13,3 +13,5 @@ project/
             ├── vocab_idx.b
             └── merges.b     (BPE only)
 ````
+Benchmark with 1000 iterations for each model:
+tisa_test_x64.exe --bench   
