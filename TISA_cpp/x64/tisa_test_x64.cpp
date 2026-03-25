@@ -93,7 +93,7 @@ static bool is_in_category_ranges(uint32_t cp, const CategoryRange* ranges, size
     return false;
 }
 
-static bool is_category(uint32_t cp, const std::string& cat) {
+static bool is_category(uint32_t cp, std::string_view cat) {
     if (cat == "P")  return is_in_category_ranges(cp, CAT_P_RANGES,  sizeof(CAT_P_RANGES) /sizeof(CategoryRange));
     if (cat == "Z")  return is_in_category_ranges(cp, CAT_Z_RANGES,  sizeof(CAT_Z_RANGES) /sizeof(CategoryRange));
     if (cat == "Mn") return is_in_category_ranges(cp, CAT_MN_RANGES, sizeof(CAT_MN_RANGES)/sizeof(CategoryRange));
@@ -299,20 +299,28 @@ static std::string_view token_view_by_id(const X64Resources& res, int32_t id) {
 struct Fragment { std::string text; bool is_protected = false; };
 struct TISA_State { std::string text; std::vector<Fragment> fragments; std::vector<int32_t> ids; };
 
-static std::string unescape_pattern(const std::string& p) {
+static std::string unescape_pattern(std::string_view p) {
     std::string r; r.reserve(p.size());
     for (size_t i = 0; i < p.size(); ++i) {
         if (p[i] == '\\' && i + 1 < p.size()) { r += p[++i]; }
-        else                                    { r += p[i]; }
+        else                                  { r += p[i]; }
     }
     return r;
 }
 
 struct Rule {
-    std::string pattern;
-    bool        is_protected = false;
-    std::string behavior;
-    std::string trim_preceding_space;
+    std::string_view pattern;
+    bool             is_protected = false;
+    std::string_view behavior;
+    std::string_view trim_preceding_space;
+
+    // Предварительно разобранные свойства паттернов для быстрого мэтчинга
+    std::string unescaped_lit;
+    bool is_opt_space_lit = false;
+    bool is_punct = false;
+    bool is_space = false;
+    bool is_cjk = false;
+    bool is_gpt = false;
 };
 
 static void op_partition_rules(TISA_State& state, const uint8_t* p, size_t /*len*/);
@@ -327,9 +335,9 @@ static void dispatch_opcode(uint8_t op, const uint8_t* p, size_t len,
     case 0x01: {
         const size_t exc_count = sizeof(LOWERCASE_EXCEPTIONS)/sizeof(UnicodeException);
         const size_t rng_count = sizeof(LOWERCASE_RANGES)/sizeof(UnicodeRange);
-        std::string result;
+        std::string result; result.reserve(s.text.length());
         for (size_t i = 0; i < s.text.length(); ) {
-            size_t cl = get_utf8_char_len(s.text[i]); if (!cl){ ++i; continue; }
+            size_t cl = get_utf8_char_len(s.text[i]); if (!cl){ result += s.text[i++]; continue; }
             uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], cl);
             uint32_t lo = cp;
             { int a=0,b=(int)exc_count-1;
@@ -339,25 +347,28 @@ static void dispatch_opcode(uint8_t op, const uint8_t* p, size_t len,
             if (lo==cp){int a=0,b=(int)rng_count-1;
               while(a<=b){int m=a+(b-a)/2;uint32_t ss=pgm_read_dword(&LOWERCASE_RANGES[m].start),ee=pgm_read_dword(&LOWERCASE_RANGES[m].end);
                 if(cp<ss)b=m-1;else if(cp>ee)a=m+1;else{lo=(uint32_t)((int32_t)cp+(int32_t)pgm_read_dword(&LOWERCASE_RANGES[m].delta));break;}}}
-            result += codepoint_to_utf8(lo); i += cl;
+            
+            if (lo == cp) result.append(s.text, i, cl);
+            else result += codepoint_to_utf8(lo);
+            i += cl;
         }
         s.text = std::move(result);
         break;
     }
     case 0x02: {
-        std::string form((char*)&p[1], p[0]);
+        std::string_view form((const char*)&p[1], p[0]);
         if (form == "NFD") {
             const size_t dc = sizeof(DECOMP_TABLE)/sizeof(Decomp);
-            std::string decomposed;
+            std::string decomposed; decomposed.reserve(s.text.length() * 2);
             for (size_t i = 0; i < s.text.length(); ) {
-                size_t cl = get_utf8_char_len(s.text[i]); if(!cl){++i;continue;}
+                size_t cl = get_utf8_char_len(s.text[i]); if(!cl){ decomposed += s.text[i++]; continue; }
                 uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], cl);
                 int a=0,b=(int)dc-1; bool found=false;
                 while(a<=b){int m=a+(b-a)/2; uint32_t f=pgm_read_dword(&DECOMP_TABLE[m].from);
                   if(cp==f){decomposed+=codepoint_to_utf8(pgm_read_dword(&DECOMP_TABLE[m].to1));
                     uint32_t t2=pgm_read_dword(&DECOMP_TABLE[m].to2); if(t2)decomposed+=codepoint_to_utf8(t2);
                     found=true;break;}else if(cp<f)b=m-1;else a=m+1;}
-                if(!found) decomposed += s.text.substr(i, cl);
+                if(!found) decomposed.append(s.text, i, cl);
                 i += cl;
             }
             s.text = std::move(decomposed);
@@ -365,36 +376,41 @@ static void dispatch_opcode(uint8_t op, const uint8_t* p, size_t len,
         break;
     }
     case 0x03: {
-        // Fix: Use memcpy to avoid unaligned pointer UB
         uint16_t pat_len; memcpy(&pat_len, &p[0], 2);
-        std::string pat((char*)&p[2], pat_len);
+        std::string_view pat((const char*)&p[2], pat_len);
         uint16_t val_len; memcpy(&val_len, &p[2 + pat_len], 2);
-        std::string val((char*)&p[4 + pat_len], val_len);
+        std::string_view val((const char*)&p[4 + pat_len], val_len);
         
-        for (size_t pos=0; (pos=s.text.find(pat,pos))!=std::string::npos; pos+=val.size())
-            s.text.replace(pos, pat.size(), val);
+        std::string res_str; res_str.reserve(s.text.size());
+        size_t last = 0, pos;
+        while ((pos = s.text.find(pat, last)) != std::string::npos) {
+            res_str.append(s.text, last, pos - last);
+            res_str.append(val);
+            last = pos + pat.size();
+        }
+        res_str.append(s.text, last, std::string::npos);
+        s.text = std::move(res_str);
         break;
     }
     case 0x04: {
         uint8_t nc = p[0]; const uint8_t* ptr = &p[1];
-        std::vector<std::string> cats; cats.reserve(nc);
-        for (int i=0;i<nc;++i){ uint8_t l=*ptr++; cats.push_back({(char*)ptr,l}); ptr+=l; }
-        std::string out;
+        std::vector<std::string_view> cats; cats.reserve(nc);
+        for (int i=0;i<nc;++i){ uint8_t l=*ptr++; cats.push_back({(const char*)ptr,l}); ptr+=l; }
+        std::string out; out.reserve(s.text.length());
         for (size_t i=0;i<s.text.length();) {
-            size_t cl=get_utf8_char_len(s.text[i]); if(!cl){++i;continue;}
+            size_t cl=get_utf8_char_len(s.text[i]); if(!cl){out+=s.text[i++];continue;}
             uint32_t cp=utf8_to_codepoint((const unsigned char*)&s.text[i],cl);
-            bool filt=false; for(auto&c:cats) if(is_category(cp,c)){filt=true;break;}
-            if(!filt) out+=s.text.substr(i,cl);
+            bool filt=false; for(auto&c:cats) if(is_category(cp, c)){filt=true;break;}
+            if(!filt) out.append(s.text, i, cl);
             i+=cl;
         }
         s.text=std::move(out);
         break;
     }
     case 0x07: {
-        // Fix: Use memcpy to avoid unaligned pointer UB
         uint16_t val_len; memcpy(&val_len, &p[0], 2);
-        std::string val((char*)&p[2], val_len);
-        if (s.text.rfind(val,0)!=0) s.text.insert(0, val);
+        std::string_view val((const char*)&p[2], val_len);
+        if (s.text.compare(0, val.size(), val) != 0) s.text.insert(0, val.data(), val.size());
         break;
     }
     case 0x10: op_partition_rules(s, p, len); break;
@@ -418,19 +434,19 @@ static void dispatch_opcode(uint8_t op, const uint8_t* p, size_t len,
     }
     case 0x22: op_unigram_encode(s, res); break;
     case 0x30: {
-        std::vector<int32_t> out;
+        std::vector<int32_t> out; out.reserve(s.ids.size() + p[0]);
         uint8_t n = p[0]; const uint8_t* ptr = &p[1];
         for (int i=0;i<n;++i) {
-            if (ptr[0]) { // FIXED
+            if (ptr[0]) {
                 ptr++;
-                if (ptr[0]) { // int
+                if (ptr[0]) {
                     ptr++; int32_t id; memcpy(&id,ptr,4); ptr+=4; out.push_back(id);
-                } else { // string name
-                    ptr++; std::string tok((char*)&ptr[1],ptr[0]); ptr+=1+tok.size();
-                    auto it=res.vocab.find(tok);
+                } else {
+                    ptr++; std::string_view tok((const char*)&ptr[1],ptr[0]); ptr+=1+tok.size();
+                    auto it=res.vocab.find(std::string(tok));
                     out.push_back(it!=res.vocab.end() ? it->second.id : 2);
                 }
-            } else { // SLOT
+            } else {
                 ptr++; out.insert(out.end(),s.ids.begin(),s.ids.end());
             }
         }
@@ -439,6 +455,7 @@ static void dispatch_opcode(uint8_t op, const uint8_t* p, size_t len,
     }
     }
 }
+
 
 static void op_partition_rules(TISA_State& state, const uint8_t* p, size_t /*len*/) {
     state.fragments.clear();
@@ -449,16 +466,32 @@ static void op_partition_rules(TISA_State& state, const uint8_t* p, size_t /*len
         if (!text.empty()) state.fragments.push_back({text, false});
         return;
     }
+    
     std::vector<Rule> rules; rules.reserve(num_rules);
     for (uint16_t i = 0; i < num_rules; ++i) {
-        Rule rule;
+        Rule r;
         uint8_t flags = *ptr++;
-        rule.is_protected = (flags & 1);
+        r.is_protected = (flags & 1);
         uint16_t pl; memcpy(&pl, ptr, 2); ptr += 2;
-        rule.pattern.assign((const char*)ptr, pl); ptr += pl;
-        if (flags & 2) { uint8_t b=*ptr++; rule.behavior=(b==1)?"REMOVE":(b==2?"ISOLATE":""); }
-        if (flags & 4) { uint8_t tl=*ptr++; rule.trim_preceding_space.assign((const char*)ptr,tl); ptr+=tl; }
-        rules.push_back(std::move(rule));
+        r.pattern = std::string_view((const char*)ptr, pl); ptr += pl;
+        if (flags & 2) { uint8_t b=*ptr++; r.behavior=(b==1)?"REMOVE":(b==2?"ISOLATE":""); }
+        if (flags & 4) { uint8_t tl=*ptr++; r.trim_preceding_space=std::string_view((const char*)ptr,tl); ptr+=tl; }
+        
+        if (r.pattern.rfind("(?: ?)", 0) == 0) {
+            r.unescaped_lit = unescape_pattern(r.pattern.substr(6));
+            r.is_opt_space_lit = true;
+        } else if (r.pattern == "\\p{P}") {
+            r.is_punct = true;
+        } else if (r.pattern == "\\s+") {
+            r.is_space = true;
+        } else if (r.pattern.find("\xe4\xb8\x80")!=std::string_view::npos || r.pattern.find("\\u4E00")!=std::string_view::npos) {
+            r.is_cjk = true;
+        } else if (r.pattern.find("'s|'t|'re") != std::string_view::npos) {
+            r.is_gpt = true;
+        } else {
+            r.unescaped_lit = unescape_pattern(r.pattern);
+        }
+        rules.push_back(std::move(r));
     }
 
     size_t last = 0;
@@ -467,54 +500,57 @@ static void op_partition_rules(TISA_State& state, const uint8_t* p, size_t /*len
         for (size_t i = 0; i < rules.size(); ++i) {
             const Rule& rule = rules[i];
             size_t ms = std::string::npos, me = 0;
-            if (rule.pattern.rfind("(?: ?)", 0) == 0) {
-                std::string lit = unescape_pattern(rule.pattern.substr(6));
-                size_t p1=text.find(lit,last), p2=text.find(" "+lit,last);
-                if (p1!=std::string::npos&&(p2==std::string::npos||p1<=p2)) { ms=p1; me=p1+lit.size(); }
-                else if (p2!=std::string::npos) { ms=p2; me=p2+1+lit.size(); }
-            } else if (rule.pattern == "\\p{P}") {
-                for (size_t k=last;k<text.length();) {
-                    size_t cl=get_utf8_char_len(text[k]); if(!cl){++k;continue;}
-                    uint32_t cp=utf8_to_codepoint((const unsigned char*)&text[k],cl);
+
+            if (rule.is_opt_space_lit) {
+                size_t p1 = text.find(rule.unescaped_lit, last);
+                if (p1 != std::string::npos) {
+                    if (p1 > last && text[p1 - 1] == ' ') { ms = p1 - 1; } 
+                    else { ms = p1; }
+                    me = p1 + rule.unescaped_lit.size();
+                }
+            } else if (rule.is_punct) {
+                for (size_t k = last; k < text.length(); ) {
+                    size_t cl = get_utf8_char_len(text[k]); if(!cl){++k;continue;}
+                    uint32_t cp = utf8_to_codepoint((const unsigned char*)&text[k], cl);
                     if ((cp=='.'||cp==','||cp=='!'||cp=='?'||cp==':'||cp==';'||cp=='"'||cp=='\''||
                          cp=='('||cp==')'||cp=='['||cp==']'||cp=='{'||cp=='}')||is_category(cp,"P"))
                         { ms=k; me=k+cl; break; }
-                    k+=cl;
+                    k += cl;
                 }
-            } else if (rule.pattern == "\\s+") {
-                for (size_t k=last;k<text.length();) {
-                    size_t cl=get_utf8_char_len(text[k]); if(!cl){++k;continue;}
+            } else if (rule.is_space) {
+                for (size_t k = last; k < text.length(); ) {
+                    size_t cl = get_utf8_char_len(text[k]); if(!cl){++k;continue;}
                     if (is_whitespace(utf8_to_codepoint((const unsigned char*)&text[k],cl))) {
-                        ms=k; size_t e=k+cl;
-                        while(e<text.length()){size_t nl=get_utf8_char_len(text[e]);if(!nl||!is_whitespace(utf8_to_codepoint((const unsigned char*)&text[e],nl)))break;e+=nl;}
-                        me=e; break;
+                        ms = k; size_t e = k + cl;
+                        while(e < text.length()){
+                            size_t nl=get_utf8_char_len(text[e]); 
+                            if(!nl||!is_whitespace(utf8_to_codepoint((const unsigned char*)&text[e],nl)))break; 
+                            e+=nl;
+                        }
+                        me = e; break;
                     }
-                    k+=cl;
+                    k += cl;
                 }
-            } else if (rule.pattern.find("\xe4\xb8\x80")!=std::string::npos ||
-                       rule.pattern.find("\\u4E00")!=std::string::npos) {
-                for (size_t k=last;k<text.length();) {
-                    size_t cl=get_utf8_char_len(text[k]); if(!cl){++k;continue;}
+            } else if (rule.is_cjk) {
+                for (size_t k = last; k < text.length(); ) {
+                    size_t cl = get_utf8_char_len(text[k]); if(!cl){++k;continue;}
                     if (is_cjk(utf8_to_codepoint((const unsigned char*)&text[k],cl))) { ms=k; me=k+cl; break; }
-                    k+=cl;
+                    k += cl;
                 }
-            } else if (rule.pattern.find("'s|'t|'re") != std::string::npos) {
+            } else if (rule.is_gpt) {
                 ms = find_gpt_next_token(text, last, me);
             } else {
-                char lit[256]; size_t ll = 0;
-                const char* pp = rule.pattern.data(); size_t plen = rule.pattern.size();
-                for (size_t j=0;j<plen&&ll<254;++j)
-                    lit[ll++] = (pp[j]=='\\'&&j+1<plen) ? pp[++j] : pp[j];
-                if (ll > 0) {
-                    const char* hay = text.data(); size_t hn = text.length();
-                    for (size_t k=last; k+ll<=hn; ++k)
-                        if (memcmp(hay+k, lit, ll)==0) { ms=k; me=k+ll; break; }
+                if (!rule.unescaped_lit.empty()) {
+                    size_t p = text.find(rule.unescaped_lit, last);
+                    if (p != std::string::npos) { ms = p; me = p + rule.unescaped_lit.size(); }
                 }
             }
+
             if (ms != std::string::npos) {
                 if (ms < bs || (ms==bs && (me-ms)>(be-bs))) { bs=ms; be=me; bi=(int)i; }
             }
         }
+        
         if (bi == -1) {
             if (last < text.length()) state.fragments.push_back({text.substr(last), false});
             break;
@@ -524,9 +560,7 @@ static void op_partition_rules(TISA_State& state, const uint8_t* p, size_t /*len
             std::string pre = text.substr(last, bs - last);
             if (!br.trim_preceding_space.empty() &&
                 pre.size() >= br.trim_preceding_space.size() &&
-                pre.compare(pre.size()-br.trim_preceding_space.size(),
-                            br.trim_preceding_space.size(),
-                            br.trim_preceding_space)==0)
+                pre.compare(pre.size()-br.trim_preceding_space.size(), br.trim_preceding_space.size(), br.trim_preceding_space)==0)
                 pre.resize(pre.size()-br.trim_preceding_space.size());
             if (!pre.empty()) state.fragments.push_back({std::move(pre), false});
         }
@@ -539,6 +573,12 @@ static void op_partition_rules(TISA_State& state, const uint8_t* p, size_t /*len
         state.fragments.push_back({text, false});
 }
 
+// Узел виртуального связного списка
+struct BPESymbol {
+    int prev, next;
+    size_t start, len;
+};
+
 // ── BPE_ENCODE (0x20) (Fully optimized - C++17 compatible) ────────────────────
 static void op_bpe_encode(TISA_State& state, const X64Resources& res) {
     int32_t unk_id = 0;
@@ -550,9 +590,8 @@ static void op_bpe_encode(TISA_State& state, const X64Resources& res) {
         state.fragments.push_back({state.text, false});
     }
 
-    // Reusable string buffer to avoid allocations inside the loop (C++17 zero-alloc)
-    std::string lookup_key;
-    lookup_key.reserve(256);
+    std::string lookup_key; lookup_key.reserve(256);
+    std::vector<BPESymbol> syms;
 
     for (const auto& frag : state.fragments) {
         if (frag.is_protected) {
@@ -568,26 +607,37 @@ static void op_bpe_encode(TISA_State& state, const X64Resources& res) {
         }
         if (frag.text.empty()) continue;
 
-        // Uses vector for contiguous memory (much better cache locality than std::list)
-        std::vector<std::string> word;
+        syms.clear();
+        syms.reserve(frag.text.size());
+
+        int prev_idx = -1;
         for (size_t off = 0; off < frag.text.size(); ) {
             size_t cl = get_utf8_char_len((unsigned char)frag.text[off]);
             if (!cl) { ++off; continue; }
-            word.push_back(frag.text.substr(off, cl));
+            syms.push_back({prev_idx, -1, off, cl});
+            int cur_idx = (int)syms.size() - 1;
+            if (prev_idx != -1) syms[prev_idx].next = cur_idx;
+            prev_idx = cur_idx;
             off += cl;
         }
 
-        if (word.empty()) continue;
+        if (syms.empty()) continue;
+        int head = 0;
 
-        while (word.size() > 1) {
+        while (true) {
             int32_t min_rank = std::numeric_limits<int32_t>::max();
-            size_t best_i = 0;
+            int best_i = -1;
 
-            for (size_t i = 0; i < word.size() - 1; ++i) {
-                // Assign and append reusing existing capacity = zero allocation
-                lookup_key.assign(word[i]);
+            // O(N) проход только по актуальным несмерженным узлам за счет связного списка
+            for (int i = head; i != -1; i = syms[i].next) {
+                int nxt = syms[i].next;
+                if (nxt == -1) break;
+
+                // Переиспользуем один буфер без аллокаций
+                lookup_key.clear();
+                lookup_key.append(frag.text, syms[i].start, syms[i].len);
                 lookup_key.push_back('\0');
-                lookup_key.append(word[i+1]);
+                lookup_key.append(frag.text, syms[nxt].start, syms[nxt].len);
 
                 auto merge_it = res.merges.find(lookup_key);
                 if (merge_it != res.merges.end() && merge_it->second < min_rank) {
@@ -596,28 +646,20 @@ static void op_bpe_encode(TISA_State& state, const X64Resources& res) {
                 }
             }
 
-            if (min_rank == std::numeric_limits<int32_t>::max()) break;
+            if (best_i == -1) break;
 
-            std::string best_a = word[best_i];
-            std::string best_b = word[best_i+1];
-
-            // Rebuild vector in-place essentially (fastest for small arrays)
-            std::vector<std::string> nw;
-            nw.reserve(word.size());
-            for (size_t i = 0; i < word.size(); ) {
-                if (i < word.size() - 1 && word[i] == best_a && word[i+1] == best_b) {
-                    nw.push_back(best_a + best_b);
-                    i += 2;
-                } else {
-                    nw.push_back(std::move(word[i]));
-                    i += 1;
-                }
+            // Выполняем O(1) слияние (переброс ссылок, длина увеличивается)
+            int nxt = syms[best_i].next;
+            syms[best_i].len += syms[nxt].len;
+            syms[best_i].next = syms[nxt].next;
+            if (syms[nxt].next != -1) {
+                syms[syms[nxt].next].prev = best_i;
             }
-            word = std::move(nw);
         }
 
-        for (const auto& tok : word) {
-            auto it = res.vocab.find(tok);
+        for (int i = head; i != -1; i = syms[i].next) {
+            lookup_key.assign(frag.text, syms[i].start, syms[i].len);
+            auto it = res.vocab.find(lookup_key);
             state.ids.push_back(it != res.vocab.end() ? it->second.id : unk_id);
         }
     }
@@ -628,6 +670,8 @@ static void op_wordpiece_encode(TISA_State& state, const X64Resources& res, cons
     int32_t unk_id = 100;
     { auto it=res.vocab.find("[UNK]"); if(it!=res.vocab.end()) unk_id=it->second.id; }
     state.ids.clear();
+    std::string lookup_key; lookup_key.reserve(256);
+    
     for (const auto& frag : state.fragments) {
         if (frag.is_protected) {
             auto it=res.vocab.find(frag.text);
@@ -638,16 +682,18 @@ static void op_wordpiece_encode(TISA_State& state, const X64Resources& res, cons
         while (start < text.length()) {
             size_t end=text.length(); bool found=false;
             while (start < end) {
-                std::string sub=text.substr(start,end-start);
-                std::string tok=(start==0)?sub:(marker+sub);
-                auto it=res.vocab.find(tok);
-                if (it!=res.vocab.end()) { state.ids.push_back(it->second.id); start=end; found=true; break; }
+                lookup_key.clear();
+                if (start > 0) lookup_key.append(marker);
+                lookup_key.append(text, start, end - start);
+                
+                auto it = res.vocab.find(lookup_key);
+                if (it != res.vocab.end()) { state.ids.push_back(it->second.id); start=end; found=true; break; }
                 if (end>start) { size_t pv=end-1; while(pv>start&&(text[pv]&0xC0)==0x80)--pv; end=pv; }
                 else break;
             }
             if (!found) {
                 state.ids.push_back(unk_id);
-                size_t cl=get_utf8_char_len(text[start]); start+=(cl>0)?cl:1;
+                size_t cl=get_utf8_char_len((unsigned char)text[start]); start+=(cl>0)?cl:1;
             }
         }
     }
@@ -658,29 +704,40 @@ static void op_unigram_encode(TISA_State& state, const X64Resources& res) {
     int32_t unk_id = 2;
     { auto it=res.vocab.find("<unk>"); if(it!=res.vocab.end()) unk_id=it->second.id; }
     state.ids.clear();
+    std::string lookup_key; lookup_key.reserve(256);
+    
     for (const auto& frag : state.fragments) {
         if (frag.is_protected) {
             auto it=res.vocab.find(frag.text);
             state.ids.push_back(it!=res.vocab.end()?it->second.id:unk_id); continue;
         }
         const std::string& text=frag.text; if(text.empty()) continue;
-        std::vector<size_t> cp; for(size_t i=0;i<text.length();){ cp.push_back(i); size_t l=get_utf8_char_len(text[i]); i+=(l>0)?l:1; } cp.push_back(text.length());
+        std::vector<size_t> cp; for(size_t i=0;i<text.length();){ cp.push_back(i); size_t l=get_utf8_char_len((unsigned char)text[i]); i+=(l>0)?l:1; } cp.push_back(text.length());
         int n=(int)(cp.size()-1); if(!n) continue;
         std::vector<float> dp(n+1,-std::numeric_limits<float>::infinity());
         std::vector<int>   path(n+1,0); dp[0]=0.f;
         for (int i=0;i<n;++i) {
             if (dp[i]<=-std::numeric_limits<float>::infinity()/2) continue;
             for (int j=i+1;j<=n&&j<=i+50;++j) {
-                std::string sub=text.substr(cp[i],cp[j]-cp[i]);
-                auto it=res.vocab.find(sub);
+                lookup_key.assign(text, cp[i], cp[j] - cp[i]);
+                auto it = res.vocab.find(lookup_key);
                 if (it!=res.vocab.end()&&dp[i]+it->second.score>dp[j]) { dp[j]=dp[i]+it->second.score; path[j]=i; }
             }
         }
         if (dp[n]<=-std::numeric_limits<float>::infinity()/2) {
-            for(int i=0;i<n;++i){ std::string ch=text.substr(cp[i],cp[i+1]-cp[i]); auto it=res.vocab.find(ch); state.ids.push_back(it!=res.vocab.end()?it->second.id:unk_id); }
+            for(int i=0;i<n;++i){
+                lookup_key.assign(text, cp[i], cp[i+1]-cp[i]);
+                auto it=res.vocab.find(lookup_key);
+                state.ids.push_back(it!=res.vocab.end()?it->second.id:unk_id);
+            }
         } else {
             std::vector<int32_t> ids; int cur=n;
-            while(cur>0){ int prev=path[cur]; std::string tok=text.substr(cp[prev],cp[cur]-cp[prev]); auto it=res.vocab.find(tok); ids.push_back(it!=res.vocab.end()?it->second.id:unk_id); cur=prev; }
+            while(cur>0){
+                int prev=path[cur];
+                lookup_key.assign(text, cp[prev], cp[cur]-cp[prev]);
+                auto it=res.vocab.find(lookup_key);
+                ids.push_back(it!=res.vocab.end()?it->second.id:unk_id); cur=prev;
+            }
             std::reverse(ids.begin(),ids.end()); state.ids.insert(state.ids.end(),ids.begin(),ids.end());
         }
     }
@@ -735,24 +792,25 @@ static bool is_special_tok(std::string_view t) {
     return t.size() > 2 && ((t.front()=='<'&&t.back()=='>')||(t.front()=='['&&t.back()==']'));
 }
 
-static std::string wp_postprocess(std::string s) {
-    { std::string out; out.reserve(s.size());
-      for (size_t i=0,n=s.size();i<n;) {
-          if (s[i]==' ') {
-              size_t j=i; while(j<n&&s[j]==' ')++j;
-              const char puncts[]=".,!?\"'";
-              if (j<n&&strchr(puncts,s[j])){i=j;continue;}
-          }
-          out+=s[i++];
-      }
-      s=std::move(out);
+static std::string wp_postprocess(std::string_view s) {
+    std::string out; out.reserve(s.size());
+    for (size_t i = 0, n = s.size(); i < n;) {
+        if (s[i] == ' ') {
+            size_t j = i; while (j < n && s[j] == ' ') ++j;
+            const char puncts[] = ".,!?\"'";
+            if (j < n && strchr(puncts, s[j])) { i = j; continue; }
+        }
+        out += s[i++];
     }
-    { std::string out; out.reserve(s.size());
-      for (size_t i=0,n=s.size();i<n;)
-          if (i+2<n&&s[i]==' '&&s[i+1]=='\''&&s[i+2]==' '){out+='\'';i+=3;}else out+=s[i++];
-      s=std::move(out);
+    std::string out2; out2.reserve(out.size());
+    for (size_t i = 0, n = out.size(); i < n;) {
+        if (i + 2 < n && out[i] == ' ' && out[i + 1] == '\'' && out[i + 2] == ' ') {
+            out2 += '\''; i += 3;
+        } else {
+            out2 += out[i++];
+        }
     }
-    return s;
+    return out2;
 }
 
 static std::string tisa_decode(const std::vector<int32_t>& ids,
@@ -774,14 +832,18 @@ static std::string tisa_decode(const std::vector<int32_t>& ids,
     switch (kind) {
     case ModelKind::BPE: {
         if (res.fast_rev_map.empty()) {
-            std::string r;
+            std::string r; r.reserve(tokens.size() * 8);
             for (auto t:tokens){
-                for (size_t i=0;i<t.size();)
-                    if(i+1<t.size()&&(uint8_t)t[i]==0xC4&&(uint8_t)t[i+1]==0xA0){r+=' ';i+=2;}else r+=t[i++];
+                for (size_t i=0;i<t.size();) {
+                    if(i+1<t.size()&&(uint8_t)t[i]==0xC4&&(uint8_t)t[i+1]==0xA0){r+=' ';i+=2;}
+                    else r+=t[i++];
+                }
             }
-            while(!r.empty()&&(uint8_t)r.front()<=0x20)r.erase(r.begin());
-            while(!r.empty()&&(uint8_t)r.back()<=0x20)r.pop_back();
-            return r;
+            size_t start = 0;
+            while(start < r.size() && (uint8_t)r[start] <= 0x20) start++;
+            size_t end = r.size();
+            while(end > start && (uint8_t)r[end-1] <= 0x20) end--;
+            return r.substr(start, end - start);
         }
 
         std::vector<uint8_t> bytes; 
@@ -815,33 +877,44 @@ static std::string tisa_decode(const std::vector<int32_t>& ids,
                 ++i; 
                 continue; 
             }
-            for (size_t k=0; k<exp; ++k) result += (char)bytes[i+k];
+            result.append((const char*)&bytes[i], exp);
             i += exp;
         }
         return result;
     }
     case ModelKind::WordPiece: {
         if (tokens.empty()) return {};
-        std::string joined; joined.reserve(tokens.size()*8);
-        for (size_t i=0;i<tokens.size();++i){if(i)joined+=' ';joined+=tokens[i];}
-        { std::string out; out.reserve(joined.size());
-          for(size_t i=0,n=joined.size();i<n;)
-              if(i+2<n&&joined[i]==' '&&joined[i+1]=='#'&&joined[i+2]=='#'){i+=3;}else out+=joined[i++];
-          joined=std::move(out); }
-        return wp_postprocess(std::move(joined));
+        std::string out; out.reserve(tokens.size() * 8);
+        for (size_t i=0; i<tokens.size(); ++i) {
+            std::string_view t = tokens[i];
+            if (i > 0) {
+                if (t.size() >= 2 && t[0] == '#' && t[1] == '#') {
+                    t = t.substr(2);
+                } else {
+                    out += ' ';
+                }
+            }
+            out += t;
+        }
+        return wp_postprocess(out);
     }
     case ModelKind::Unigram: {
         std::string s; s.reserve(tokens.size()*6);
         for (auto t:tokens) s+=t;
         std::string out; out.reserve(s.size());
-        for (size_t i=0;i<s.size();)
-            if(i+2<s.size()&&(uint8_t)s[i]==SP3[0]&&(uint8_t)s[i+1]==SP3[1]&&(uint8_t)s[i+2]==SP3[2]){out+=' ';i+=3;}else out+=s[i++];
-        while(!out.empty()&&(uint8_t)out.front()<=0x20)out.erase(out.begin());
-        while(!out.empty()&&(uint8_t)out.back()<=0x20)out.pop_back();
-        return out;
+        for (size_t i=0;i<s.size();) {
+            if(i+2<s.size()&&(uint8_t)s[i]==SP3[0]&&(uint8_t)s[i+1]==SP3[1]&&(uint8_t)s[i+2]==SP3[2]){out+=' ';i+=3;}
+            else out+=s[i++];
+        }
+        size_t start = 0;
+        while(start < out.size() && (uint8_t)out[start] <= 0x20) start++;
+        size_t end = out.size();
+        while(end > start && (uint8_t)out[end-1] <= 0x20) end--;
+        return out.substr(start, end - start);
     }
     default: {
-        std::string r; for(size_t i=0;i<tokens.size();++i){if(i)r+=' ';r+=tokens[i];} return r;
+        std::string r; r.reserve(tokens.size()*8);
+        for(size_t i=0;i<tokens.size();++i){if(i)r+=' ';r+=tokens[i];} return r;
     }
     }
 }
@@ -953,10 +1026,22 @@ int main(int argc, char* argv[]) {
     SetConsoleCP(65001);
 #endif
 
+    bool bench_mode = false;
+
     std::string models_dir = "models";
     std::string suite_path = "tisa_test_suite.bin";
-    if (argc >= 2) models_dir = argv[1];
-    if (argc >= 3) suite_path = argv[2];
+
+    // ---- parse args ----
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--bench") {
+            bench_mode = true;
+        } else if (i == 1) {
+            models_dir = arg;
+        } else if (i == 2) {
+            suite_path = arg;
+        }
+    }
 
     printf("\n");
     printf("+================================================================+\n");
@@ -964,6 +1049,11 @@ int main(int argc, char* argv[]) {
     printf("|           Copyright (c) 2026 Dmitry Feklin                     |\n");
     printf("+================================================================+\n");
     printf("\n");
+
+    if (bench_mode) {
+        printf("[mode] BENCH ENABLED (1000 iterations per model)\n");
+    }
+
     printf("[init] Models dir : %s\n", models_dir.c_str());
     printf("[init] Test suite : %s\n", suite_path.c_str());
 
@@ -978,6 +1068,27 @@ int main(int argc, char* argv[]) {
     printf("[init] Test cases : %u\n\n", (unsigned)cases.size());
 
     uint32_t total=0, passed_enc=0, failed_enc=0, passed_dec=0, errors=0;
+
+    struct ModelStats {
+        uint32_t tests = 0;
+        uint32_t pass = 0;
+        uint32_t fail = 0;
+        double enc_time_us = 0.0;
+        double dec_time_us = 0.0;
+
+        // bench stats
+        double enc_min = 1e30;
+        double enc_max = 0.0;
+        double enc_sum = 0.0;
+        uint32_t enc_iters = 0;
+
+        double dec_min = 1e30;
+        double dec_max = 0.0;
+        double dec_sum = 0.0;
+        uint32_t dec_iters = 0;
+    };
+
+    std::unordered_map<std::string, ModelStats> stats;
 
     for (size_t i = 0; i < cases.size(); ++i) {
         const TestCase& tc = cases[i];
@@ -1002,40 +1113,114 @@ int main(int argc, char* argv[]) {
 
         ModelKind kind = detect_model_kind(*res, res->merges_loaded, false);
 
-        auto t0 = std::chrono::high_resolution_clock::now();
-        auto vm_ids = tisa_run(tc.manifest, tc.text, *res);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double enc_us = std::chrono::duration<double,std::micro>(t1-t0).count();
+        ModelStats& st = stats[tc.model_id];
+        st.tests++;
 
-        bool enc_ok = (vm_ids == tc.ref_ids);
-        if (enc_ok) {
-            printf("  [PASS] ENCODE  [%u tokens]  %.1f us\n", (unsigned)vm_ids.size(), enc_us);
-            ++passed_enc;
-        } else {
-            printf("  [FAIL] ENCODE  vm=%u tokens  ref=%u tokens\n",
-                   (unsigned)vm_ids.size(), (unsigned)tc.ref_ids.size());
-            size_t maxl = std::max(vm_ids.size(), tc.ref_ids.size());
-            for (size_t j=0;j<maxl&&j<5;++j) {
-                int32_t vm_id  = (j<vm_ids.size())   ? vm_ids[j]   : -1;
-                int32_t ref_id = (j<tc.ref_ids.size())? tc.ref_ids[j]: -1;
-                if (vm_id!=ref_id) printf("  [%u] vm=%d ref=%d\n",(unsigned)j,vm_id,ref_id);
+        // ---------------------------
+        // BENCH MODE
+        // ---------------------------
+        if (bench_mode) {
+            const int N = 1000;
+
+            // encode bench
+            std::vector<double> enc_times;
+            enc_times.reserve(N);
+
+            std::vector<double> dec_times;
+            dec_times.reserve(N);
+
+            for (int i = 0; i < N; ++i) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                auto vm_ids = tisa_run(tc.manifest, tc.text, *res);
+                auto t1 = std::chrono::high_resolution_clock::now();
+
+                double enc_us = std::chrono::duration<double,std::micro>(t1-t0).count();
+                enc_times.push_back(enc_us);
+
+                auto t2 = std::chrono::high_resolution_clock::now();
+                std::string decoded = tisa_decode(tc.ref_ids, *res, kind);
+                auto t3 = std::chrono::high_resolution_clock::now();
+
+                double dec_us = std::chrono::duration<double,std::micro>(t3-t2).count();
+                dec_times.push_back(dec_us);
             }
-            ++failed_enc;
+
+            auto compute_stats = [](const std::vector<double>& v,
+                                    double& min_v,
+                                    double& max_v,
+                                    double& avg_v)
+            {
+                min_v = 1e30;
+                max_v = 0.0;
+                double sum = 0.0;
+
+                for (double x : v) {
+                    if (x < min_v) min_v = x;
+                    if (x > max_v) max_v = x;
+                    sum += x;
+                }
+                avg_v = sum / v.size();
+            };
+
+            double enc_min, enc_max, enc_avg;
+            double dec_min, dec_max, dec_avg;
+
+            compute_stats(enc_times, enc_min, enc_max, enc_avg);
+            compute_stats(dec_times, dec_min, dec_max, dec_avg);
+
+            st.enc_min = enc_min;
+            st.enc_max = enc_max;
+            st.enc_sum += enc_avg * N;
+            st.enc_iters += N;
+
+            st.dec_min = dec_min;
+            st.dec_max = dec_max;
+            st.dec_sum += dec_avg * N;
+            st.dec_iters += N;
+
+            printf("  [BENCH] ENC avg=%.2f us min=%.2f max=%.2f\n", enc_avg, enc_min, enc_max);
+            printf("  [BENCH] DEC avg=%.2f us min=%.2f max=%.2f\n", dec_avg, dec_min, dec_max);
+
+        } else {
+            // ---------------------------
+            // NORMAL MODE
+            // ---------------------------
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto vm_ids = tisa_run(tc.manifest, tc.text, *res);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double enc_us = std::chrono::duration<double,std::micro>(t1-t0).count();
+
+            bool enc_ok = (vm_ids == tc.ref_ids);
+
+            if (enc_ok) {
+                printf("  [PASS] ENCODE  [%u tokens]  %.1f us\n", (unsigned)vm_ids.size(), enc_us);
+                ++passed_enc;
+                st.pass++;
+            } else {
+                printf("  [FAIL] ENCODE  vm=%u tokens  ref=%u tokens\n",
+                       (unsigned)vm_ids.size(), (unsigned)tc.ref_ids.size());
+                ++failed_enc;
+                st.fail++;
+            }
+
+            auto t2 = std::chrono::high_resolution_clock::now();
+            std::string decoded = tisa_decode(tc.ref_ids, *res, kind);
+            auto t3 = std::chrono::high_resolution_clock::now();
+            double dec_us = std::chrono::duration<double,std::micro>(t3-t2).count();
+
+            printf("         DECODE  '%s'  %.1f us\n", decoded.c_str(), dec_us);
+
+            st.enc_time_us += enc_us;
+            st.dec_time_us += dec_us;
+
+            bool rt_ok = (decoded == tc.text);
+            if (rt_ok) ++passed_dec;
         }
-
-        auto t2 = std::chrono::high_resolution_clock::now();
-        std::string decoded = tisa_decode(tc.ref_ids, *res, kind);
-        auto t3 = std::chrono::high_resolution_clock::now();
-        double dec_us = std::chrono::duration<double,std::micro>(t3-t2).count();
-
-        printf("         DECODE  '%s'  %.1f us\n", decoded.c_str(), dec_us);
-
-        // Fix: Restored original logic. Uncased models change the case, so exact match fails.
-        // If it decodes *something* reasonably, we consider the decode path fully functional.
-        bool rt_ok = (decoded == tc.text); // || !decoded.empty()
-        if (rt_ok) ++passed_dec;
     }
 
+    // ---------------------------
+    // SUMMARY
+    // ---------------------------
     printf("\n");
     printf("+================================================================+\n");
     printf("|                       TEST SUMMARY                             |\n");
@@ -1047,34 +1232,49 @@ int main(int argc, char* argv[]) {
     printf("|  Errors         : %3u                                          |\n", errors);
     printf("+================================================================+\n");
 
-    if (!g_res_cache.empty()) {
-        printf("\n[bench] Warming up with last loaded model...\n");
-        const auto& [bh, bres] = *g_res_cache.rbegin();
-        ModelKind bk = detect_model_kind(*bres, bres->merges_loaded, false);
+    // ---------------------------
+    // MODEL TABLE
+    // ---------------------------
+    printf("\n+================================================================+\n");
+    printf("|                    MODEL PERFORMANCE TABLE                     |\n");
+    printf("+================================================================+\n");
 
-        const TestCase* btc = nullptr;
-        for (const auto& tc : cases) {
-            auto mit=model_map.find(tc.model_id);
-            if (mit!=model_map.end()&&mit->second==bh) { btc=&tc; break; }
+    if (bench_mode) {
+        printf("| %-47s | %-5s | %-5s | %-10s | %-10s | %-10s |\n",
+               "Model", "PASS", "FAIL", "ENC(avg)", "ENC(min)", "ENC(max)");
+        printf("+----------------------------------------------------------------+\n");
+
+        for (const auto& [model_id, st] : stats) {
+            double avg_enc = st.enc_iters ? st.enc_sum / st.enc_iters : 0.0;
+
+            printf("| %-47s | %-5u | %-5u | %-10.2f | %-10.2f | %-10.2f |\n",
+                   model_id.c_str(),
+                   st.pass,
+                   st.fail,
+                   avg_enc,
+                   st.enc_min,
+                   st.enc_max);
         }
-        if (btc) {
-            const int N = 10000;
-            auto b0 = std::chrono::high_resolution_clock::now();
-            for (int i=0;i<N;++i) tisa_run(btc->manifest, btc->text, *bres);
-            auto b1 = std::chrono::high_resolution_clock::now();
-            double enc_ms = std::chrono::duration<double,std::milli>(b1-b0).count();
 
-            b0 = std::chrono::high_resolution_clock::now();
-            for (int i=0;i<N;++i) tisa_decode(btc->ref_ids, *bres, bk);
-            b1 = std::chrono::high_resolution_clock::now();
-            double dec_ms = std::chrono::duration<double,std::milli>(b1-b0).count();
+    } else {
+        printf("| %-47s | %-5s | %-5s | %-10s | %-10s |\n",
+               "Model", "PASS", "FAIL", "ENC(us)", "DEC(us)");
+        printf("+----------------------------------------------------------------+\n");
 
-            printf("[bench] Model: %s | %s\n", btc->model_id.c_str(), bh.c_str());
-            printf("[bench] Encode: %.1f ms / %d iters = %.0f ns/call\n", enc_ms, N, enc_ms*1e6/N);
-            printf("[bench] Decode: %.1f ms / %d iters = %.0f ns/call\n", dec_ms, N, dec_ms*1e6/N);
+        for (const auto& [model_id, st] : stats) {
+            double avg_enc = st.tests ? st.enc_time_us / st.tests : 0.0;
+            double avg_dec = st.tests ? st.dec_time_us / st.tests : 0.0;
+
+            printf("| %-47s | %-5u | %-5u | %-10.1f | %-10.1f |\n",
+                   model_id.c_str(),
+                   st.pass,
+                   st.fail,
+                   avg_enc,
+                   avg_dec);
         }
     }
 
-    printf("\n");
+    printf("+================================================================+\n");
+
     return (failed_enc > 0 || errors > 0) ? 1 : 0;
 }
